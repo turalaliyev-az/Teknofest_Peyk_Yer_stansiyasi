@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import time
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QComboBox, QHBoxLayout, QLabel, QMainWindow, QPlainTextEdit, QPushButton,
     QSpinBox, QSplitter, QVBoxLayout, QWidget,
 )
 
 from ..comm import packet
+from ..comm.csv_parser import CsvLineParser
 from ..comm.link import SerialLink, list_serial_ports
 from ..comm.simulator import SimulatorLink
 from .camera_widget import CameraWidget, UdpCameraSource, WebcamSource
@@ -30,18 +31,28 @@ class MainWindow(QMainWindow):
 
         self._link = None
         self._parser = packet.FrameParser()
+        self._csv_parser = CsvLineParser()
+        self._csv_seen = False
         self._cam_assembler = packet.CameraAssembler()
         self._webcam = None
         self._udp = None
 
         self._counters = {"tel": 0, "gps": 0, "sts": 0, "cam": 0, "tx": 0}
+        self._rx_bytes = 0
+        self._hex_rx = False
+        self._hex_buf = bytearray()
+        self._last_bad_warn = 0.0
         self._last_rx = time.time()
 
         self._build_ui()
         self.command_panel.command_requested.connect(self._send_command)
         self._build_control_bar()
 
-        self._counters_lbl = QLabel("TEL: 0  GPS: 0  STS: 0  CAM: 0  TX: 0")
+        self._hex_timer = QTimer(self)
+        self._hex_timer.setInterval(500)
+        self._hex_timer.timeout.connect(self._flush_hex)
+
+        self._counters_lbl = QLabel("TEL: 0  GPS: 0  STS: 0  CAM: 0  RX: 0 B  TX: 0")
         self.statusBar().addPermanentWidget(self._counters_lbl)
         self.statusBar().showMessage("Hazır. Bağlanmak için Simülatör veya Seri Port seçin.")
 
@@ -127,6 +138,12 @@ class MainWindow(QMainWindow):
         self._connect_btn = QPushButton("Bağlan")
         self._connect_btn.clicked.connect(self._toggle_connect)
         bar.addWidget(self._connect_btn)
+
+        self._hex_btn = QPushButton("Ham RX: OFF")
+        self._hex_btn.setCheckable(True)
+        self._hex_btn.setToolTip("Gelen ham baytları hex olarak logla (teşhis için)")
+        self._hex_btn.toggled.connect(self._toggle_hex)
+        bar.addWidget(self._hex_btn)
 
         bar.addSpacing(16)
 
@@ -222,41 +239,75 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _on_data(self, data: bytes) -> None:
         self._last_rx = time.time()
-        for type_byte, payload in self._parser.feed(data):
+        self._rx_bytes += len(data)
+        if self._hex_rx:
+            self._hex_buf.extend(data)
+
+        frames = self._parser.feed(data)
+        if not frames and b"\xaa\x55" in data:
+            # SYNC görüldü ama geçerli çerçeve çözülemedi -> olası uyuşmazlık
+            if time.time() - self._last_bad_warn > 3.0:
+                self._last_bad_warn = time.time()
+                self._log("UYARI: ham veri geliyor ama geçerli çerçeve çözülemedi "
+                          "(baudrate/protokol uyuşmazlığı olabilir). 'Ham RX' ile baytlara bakın.")
+
+        for type_byte, payload in frames:
             try:
                 self._dispatch(type_byte, payload)
             except Exception as exc:  # noqa: BLE001
                 self._log(f"Ayrıştırma hatası (0x{type_byte:02x}): {exc}")
 
+        # CSV satırları (gerçek peyk ASCII/CSV gönderiyorsa)
+        for tm, g, s in self._csv_parser.feed(data):
+            if not self._csv_seen:
+                self._csv_seen = True
+                self._log("CSV telemetri algılandı (ikili protokol yerine).")
+            try:
+                if tm is not None:
+                    self._apply_telemetry(tm)
+                if g is not None and (g.lat != 0.0 or g.lon != 0.0):
+                    self._apply_gps(g)
+                if s is not None:
+                    self._apply_status(s)
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"CSV ayrıştırma hatası: {exc}")
+        self._update_counters()
+
     def _dispatch(self, type_byte: int, payload: bytes) -> None:
         if type_byte == packet.TYPE_TELEMETRY:
-            tm = packet.unpack_telemetry(payload)
-            self._counters["tel"] += 1
-            self.telemetry.update_telemetry(tm)
-            self.globe.set_attitude(tm.roll, tm.pitch, tm.yaw)
-            self.plot.add_sample({
-                "bat_v": tm.battery_v, "bat_i": tm.battery_i,
-                "temp_cpu": tm.temp_cpu, "temp_batt": tm.temp_batt,
-                "altitude": tm.altitude,
-                "roll": tm.roll, "pitch": tm.pitch, "yaw": tm.yaw,
-                "rssi": tm.rssi,
-            })
+            self._apply_telemetry(packet.unpack_telemetry(payload))
         elif type_byte == packet.TYPE_GPS:
-            g = packet.unpack_gps(payload)
-            self._counters["gps"] += 1
-            self.telemetry.update_gps(g)
-            self.map.set_gps(g.lat, g.lon)
+            self._apply_gps(packet.unpack_gps(payload))
         elif type_byte == packet.TYPE_STATUS:
-            s = packet.unpack_status(payload)
-            self._counters["sts"] += 1
-            self.telemetry.update_status(s)
-            self._update_armed_indicator(s)
+            self._apply_status(packet.unpack_status(payload))
         elif type_byte == packet.TYPE_CAMERA:
             jpg = self._cam_assembler.feed(payload)
             if jpg:
                 self._counters["cam"] += 1
                 self.camera.show_jpeg(jpg)
         self._update_counters()
+
+    def _apply_telemetry(self, tm: packet.TelemetryData) -> None:
+        self._counters["tel"] += 1
+        self.telemetry.update_telemetry(tm)
+        self.globe.set_attitude(tm.roll, tm.pitch, tm.yaw)
+        self.plot.add_sample({
+            "bat_v": tm.battery_v, "bat_i": tm.battery_i,
+            "temp_cpu": tm.temp_cpu, "temp_batt": tm.temp_batt,
+            "altitude": tm.altitude,
+            "roll": tm.roll, "pitch": tm.pitch, "yaw": tm.yaw,
+            "rssi": tm.rssi,
+        })
+
+    def _apply_gps(self, g: packet.GpsData) -> None:
+        self._counters["gps"] += 1
+        self.telemetry.update_gps(g)
+        self.map.set_gps(g.lat, g.lon)
+
+    def _apply_status(self, s: packet.StatusData) -> None:
+        self._counters["sts"] += 1
+        self.telemetry.update_status(s)
+        self._update_armed_indicator(s)
 
     def _update_armed_indicator(self, s: packet.StatusData) -> None:
         if s.state == packet.STATE_ARMED:
@@ -273,7 +324,7 @@ class MainWindow(QMainWindow):
         c = self._counters
         self._counters_lbl.setText(
             f"TEL: {c['tel']}  GPS: {c['gps']}  STS: {c['sts']}  "
-            f"CAM: {c['cam']}  TX: {c['tx']}"
+            f"CAM: {c['cam']}  RX: {self._rx_bytes} B  TX: {c['tx']}"
         )
 
     # ------------------------------------------------------------------
@@ -318,6 +369,26 @@ class MainWindow(QMainWindow):
         extra = payload.hex() if payload else ""
         self._log(f"TX -> {name} {extra}")
         self._update_counters()
+
+    def _toggle_hex(self, on: bool) -> None:
+        self._hex_rx = on
+        self._hex_btn.setText("Ham RX: AÇIK" if on else "Ham RX: OFF")
+        if on:
+            self._hex_buf.clear()
+            self._hex_timer.start()
+            self._log("Ham RX izleme açıldı — gelen baytlar hex olarak loglanacak.")
+        else:
+            self._hex_timer.stop()
+            self._log("Ham RX izleme kapatıldı.")
+
+    def _flush_hex(self) -> None:
+        if not self._hex_buf:
+            return
+        data = bytes(self._hex_buf)
+        self._hex_buf.clear()
+        shown = data[-96:] if len(data) > 96 else data
+        note = f"  ... (toplam {len(data)} bayt)" if len(data) > 96 else ""
+        self._log(f"RX hex: {shown.hex(' ')}{note}")
 
     def _log(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")

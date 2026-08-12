@@ -9,7 +9,7 @@ kamera ve 3D attitude verilerini gerçek zamanlı görselleştirir ve peyke
 
 - 📷 **Kamera görüntüsü** — 3 kaynak: uydu linki (paketlerden), USB **webcam**, **UDP** stream.
 - 🛰️ **3D uydu görseli** (OpenGL) — roll / pitch / yaw canlı döner, Dünya + yörünge halkası referansı.
-- 📍 **GPS → harita** — equirectangular dünya haritası üzerinde konum + zemin izi (ground track).
+- 📍 **GPS → harita** — Google Earth/Maps tarzı karo harita: uydu görüntüsü (Esri) veya yol haritası (OSM), fareyle kaydırma, tekerlekle zoom, konum + zemin izi (ground track).
 - 📊 **Telemetri** — batarya, sıcaklık, basınç, irtifa, gyro/accel/mag, RSSI (sayısal panel).
 - 📈 **Grafikler** (pyqtgraph) — batarya, sıcaklık, irtifa, attitude, RSSI zaman serisi.
 - 🎛️ **Uplink komutları** — PING, **ARM**, **DISARM**, DEPLOY, REBOOT, CAMERA ON/OFF, SET MODE, TELEMETRY RATE, RAW.
@@ -110,11 +110,18 @@ gs/
     camera_widget.py      # kamera + webcam/UDP kaynakları
     plot_widget.py        # zaman serisi grafikleri
     command_panel.py      # uplink komut paneli
-  assets/
-    world_map.jpg         # equirectangular dünya haritası
 ```
+
+Harita karoları (uydu/yol görüntüsü) çevrimiçi sunuculardan indirilir ve
+`~/.cache/gs_tiles/` altında diskte önbelleğe alınır; böylece aynı bölge
+bir sonraki açılışta internet olmadan da görüntülenebilir.
+
 
 ## Notlar
 
 - Gerçek donanımla kullanırken baudrate ve portu peyk/radyo ayarlarıyla eşleştirin.
 - UDP kamera varsayılan portu `5600`; her UDP datagramı tek bir JPEG kare olarak beklenir.
+- **CSV telemetri**: Peyk ikili protokol yerine virgülle ayrılmış ASCII/CSV
+  satırı gönderiyorsa yer istasyonu bunu otomatik algılar. Alan eşleştirmesi
+  `gs/comm/csv_parser.py` içindeki `IDX_*` sabitlerinde yapılır — kendi
+  peykinin gönderdiği sıraya göre bu indeksleri düzenleyin.
